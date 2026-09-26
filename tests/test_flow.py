@@ -34,5 +34,52 @@ class VulnerabilityFlowTest(unittest.TestCase):
         self.db.add_evidence(self.report,"协调材料","secret","coordinator",self.coord)
         visible=self.db.get_report_for_user(self.report,self.maint)
         self.assertEqual([],visible["evidence"])
+    def _member_with_private_evidence(self):
+        self.db.add_member(self.report,self.maint,"maintainer",self.coord)
+        return self.db.add_evidence(self.report,"复现脚本","poc 详情","private",self.reporter)
+    def test_time_limited_evidence_grant_flow(self):
+        ev=self._member_with_private_evidence()
+        self.assertEqual([],self.db.get_report_for_user(self.report,self.maint)["evidence"])
+        self.db.grant_evidence(self.report,ev,self.maint,"2099-10-15",self.coord)
+        visible=self.db.get_report_for_user(self.report,self.maint)
+        self.assertEqual([ev],[e["id"] for e in visible["evidence"]])
+        self.assertEqual(1,len(visible["grants"]["active"]))
+        self.assertEqual([],visible["grants"]["expired"])
+        expired=self.db.get_report_for_user(self.report,self.maint,"2099-10-16")
+        self.assertEqual([],expired["evidence"])
+        self.assertEqual("expired",expired["grants"]["expired"][0]["state"])
+        self.db.grant_evidence(self.report,ev,self.maint,"2099-11-01",self.coord)
+        detail=self.db.get_report_for_user(self.report,self.coord)
+        self.assertEqual("2099-11-01",detail["grants"]["active"][0]["expires_on"])
+        events=detail["grant_events"]
+        self.assertEqual(["granted","regranted"],[e["action"] for e in events])
+        self.assertEqual("2099-10-15",events[1]["old_expires_on"])
+        self.assertEqual("2099-11-01",events[1]["new_expires_on"])
+        self.db.revoke_evidence_grant(self.report,ev,self.maint,self.coord)
+        revoked=self.db.get_report_for_user(self.report,self.maint)
+        self.assertEqual([],revoked["evidence"])
+        self.assertEqual("revoked",revoked["grants"]["expired"][0]["state"])
+        self.db.grant_evidence(self.report,ev,self.maint,"2099-11-02",self.coord)
+        self.assertEqual([ev],[e["id"] for e in self.db.get_report_for_user(self.report,self.maint)["evidence"]])
+    def test_grant_rules_and_publish_invalidates_grants(self):
+        ev=self._member_with_private_evidence()
+        with self.assertRaisesRegex(DomainError,"只有协调员"):
+            self.db.grant_evidence(self.report,ev,self.maint,"2099-10-15",self.maint)
+        with self.assertRaisesRegex(DomainError,"不能早于今天"):
+            self.db.grant_evidence(self.report,ev,self.maint,"2020-01-01",self.coord)
+        with self.assertRaisesRegex(DomainError,"报告的成员"):
+            self.db.grant_evidence(self.report,ev,self.outsider,"2099-10-15",self.coord)
+        coord_ev=self.db.add_evidence(self.report,"内部评估","secret","coordinator",self.coord)
+        with self.assertRaisesRegex(DomainError,"协调员专用"):
+            self.db.grant_evidence(self.report,coord_ev,self.maint,"2099-10-15",self.coord)
+        self.db.grant_evidence(self.report,ev,self.maint,"2099-10-15",self.coord)
+        self._advance_to_resolved()
+        self.db.publish_report(self.report,self.coord,"2026-10-30")
+        detail=self.db.get_report_for_user(self.report,self.coord)
+        self.assertEqual([],detail["grants"]["active"])
+        self.assertEqual("published_out",detail["grants"]["expired"][0]["state"])
+        self.assertIn("published_out",[e["action"] for e in detail["grant_events"]])
+        with self.assertRaisesRegex(DomainError,"已公开"):
+            self.db.grant_evidence(self.report,ev,self.maint,"2099-12-01",self.coord)
 
 if __name__=="__main__": unittest.main()

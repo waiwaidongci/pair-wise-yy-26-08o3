@@ -27,7 +27,7 @@ class Handler(BaseHTTPRequestHandler):
                 data=(BASE/"static"/"index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Content-Length",str(len(data))); self.end_headers(); self.wfile.write(data); return
             if parsed.path=="/api/state": return self._json(200,self.db.snapshot())
             if len(parts)==3 and parts[:2]==["api","reports"]:
-                uid=int(parse_qs(parsed.query).get("user_id",[0])[0]); return self._json(200,self.db.get_report_for_user(int(parts[2]),uid))
+                q=parse_qs(parsed.query); return self._json(200,self.db.get_report_for_user(int(parts[2]),int(q.get("user_id",[0])[0]),q.get("as_of",[None])[0]))
             if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="notifications":
                 return self._json(200,{"notifications":self.db.notifications_for(int(parts[2]))})
             if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="advisory":
@@ -45,6 +45,8 @@ class Handler(BaseHTTPRequestHandler):
             if path=="/api/reports": return self._json(201,{"ok":True,"id":self.db.create_report(str(b.get("title","")),int(b.get("product_id",0)),int(b.get("reporter_id",0)),str(b.get("summary","")),str(b.get("confidential_until","")),list(b.get("versions",[])),str(b.get("version_details","")),bool(b.get("allow_duplicate",False)))})
             if path=="/api/members": self.db.add_member(int(b.get("report_id",0)),int(b.get("user_id",0)),str(b.get("member_role","maintainer")),int(b.get("added_by",0))); return self._json(201,{"ok":True})
             if path=="/api/evidence": return self._json(201,{"ok":True,"id":self.db.add_evidence(int(b.get("report_id",0)),str(b.get("name","")),str(b.get("content","")),str(b.get("classification","private")),int(b.get("uploaded_by",0)))})
+            if path=="/api/grants": return self._json(201,{"ok":True,"id":self.db.grant_evidence(int(b.get("report_id",0)),int(b.get("evidence_id",0)),int(b.get("user_id",0)),str(b.get("expires_on","")),int(b.get("coordinator_id",0)))})
+            if path=="/api/grants/revoke": self.db.revoke_evidence_grant(int(b.get("report_id",0)),int(b.get("evidence_id",0)),int(b.get("user_id",0)),int(b.get("coordinator_id",0))); return self._json(200,{"ok":True})
             if path=="/api/fixes": return self._json(201,{"ok":True,"id":self.db.set_fix_plan(int(b.get("report_id",0)),int(b.get("maintainer_id",0)),str(b.get("plan","")),b.get("target_date"))})
             if path=="/api/extensions": return self._json(201,{"ok":True,"id":self.db.extend_embargo(int(b.get("report_id",0)),str(b.get("new_deadline","")),str(b.get("reason","")),int(b.get("coordinator_id",0)))})
             if path=="/api/advisories": return self._json(201,{"ok":True,"id":self.db.create_advisory_draft(int(b.get("report_id",0)),str(b.get("content","")),int(b.get("user_id",0)))})

@@ -141,6 +141,30 @@ class VulnerabilityDB:
               created_at TEXT NOT NULL,
               published_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS evidence_grants (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              report_id INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+              evidence_id INTEGER NOT NULL REFERENCES evidence(id) ON DELETE CASCADE,
+              user_id INTEGER NOT NULL REFERENCES users(id),
+              expires_on TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','revoked','published_out')),
+              granted_by INTEGER NOT NULL REFERENCES users(id),
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(evidence_id, user_id)
+            );
+            CREATE TABLE IF NOT EXISTS evidence_grant_events (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              grant_id INTEGER NOT NULL,
+              report_id INTEGER NOT NULL,
+              evidence_id INTEGER NOT NULL,
+              user_id INTEGER NOT NULL,
+              action TEXT NOT NULL CHECK(action IN ('granted','regranted','revoked','published_out')),
+              old_expires_on TEXT,
+              new_expires_on TEXT,
+              actor_id INTEGER NOT NULL REFERENCES users(id),
+              created_at TEXT NOT NULL
+            );
             """
         )
         self.conn.commit()
@@ -154,7 +178,8 @@ class VulnerabilityDB:
         product = self.add_product("示例网关", "示例项目组")
         report = self.create_report("网关鉴权绕过", product, reporter, "特制请求可跳过鉴权。", "2026-10-30", ["3.2.0"], "仅影响 3.2.0")
         self.add_member(report, maintainer, "maintainer", coordinator)
-        self.add_evidence(report, "请求样例", "GET /admin HTTP/1.1\nX-Test: bypass", "private", reporter)
+        poc = self.add_evidence(report, "请求样例", "GET /admin HTTP/1.1\nX-Test: bypass", "private", reporter)
+        self.grant_evidence(report, poc, maintainer, (date.today() + timedelta(days=30)).isoformat(), coordinator)
         self.set_status(report, "triaged", coordinator, "已确认复现")
         self.set_fix_plan(report, maintainer, "增加鉴权前置校验并补充回归测试", "2026-10-10")
 
@@ -183,6 +208,14 @@ class VulnerabilityDB:
         if not user:
             raise DomainError("用户不存在")
         return user
+
+    def _today(self, as_of: str | None = None) -> date:
+        if as_of is None:
+            return date.today()
+        try:
+            return datetime.strptime(as_of, "%Y-%m-%d").date()
+        except ValueError as exc:
+            raise DomainError("日期必须使用 YYYY-MM-DD") from exc
 
     def find_duplicate_reports(self, product_id: int, version_key: str) -> list[dict]:
         rows = self.conn.execute(
@@ -281,7 +314,108 @@ class VulnerabilityDB:
                 raise DomainError("同一报告中的材料名称不能重复") from exc
         return int(cur.lastrowid)
 
-    def get_report_for_user(self, report_id: int, user_id: int) -> dict:
+    def grant_evidence(self, report_id: int, evidence_id: int, user_id: int, expires_on: str,
+                       coordinator_id: int, as_of: str | None = None) -> int:
+        actor = self._user(coordinator_id)
+        if actor["role"] != "coordinator":
+            raise DomainError("只有协调员可以授权材料")
+        report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+        if not report:
+            raise DomainError("报告不存在")
+        if report["status"] == "published":
+            raise DomainError("已公开报告不能再授权材料")
+        evidence = self.conn.execute("SELECT * FROM evidence WHERE id=? AND report_id=?", (evidence_id, report_id)).fetchone()
+        if not evidence:
+            raise DomainError("材料不存在")
+        if evidence["classification"] == "coordinator":
+            raise DomainError("协调员专用材料不能授权")
+        self._user(user_id)
+        if not self._member(report_id, user_id):
+            raise DomainError("只能授权给该报告的成员")
+        expiry = self._today(expires_on)
+        if expiry < self._today(as_of):
+            raise DomainError("授权到期时间不能早于今天")
+        now = datetime.now().isoformat()
+        with self.transaction():
+            existing = self.conn.execute(
+                "SELECT * FROM evidence_grants WHERE evidence_id=? AND user_id=?", (evidence_id, user_id)
+            ).fetchone()
+            if existing:
+                grant_id = existing["id"]
+                action, old_expiry = "regranted", existing["expires_on"]
+                self.conn.execute(
+                    "UPDATE evidence_grants SET expires_on=?,status='active',granted_by=?,updated_at=? WHERE id=?",
+                    (expires_on, coordinator_id, now, grant_id),
+                )
+            else:
+                action, old_expiry = "granted", None
+                grant_id = int(self.conn.execute(
+                    "INSERT INTO evidence_grants(report_id,evidence_id,user_id,expires_on,granted_by,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?)",
+                    (report_id, evidence_id, user_id, expires_on, coordinator_id, now, now),
+                ).lastrowid)
+            self._grant_event(grant_id, report_id, evidence_id, user_id, action, old_expiry, expires_on, coordinator_id)
+            message = f"材料《{evidence['name']}》的查看授权有效期至 {expires_on}"
+            self._notify(report_id, user_id, "grant", message if action == "granted" else f"授权已更新：{message}")
+        return grant_id
+
+    def revoke_evidence_grant(self, report_id: int, evidence_id: int, user_id: int, coordinator_id: int) -> None:
+        actor = self._user(coordinator_id)
+        if actor["role"] != "coordinator":
+            raise DomainError("只有协调员可以撤销授权")
+        grant = self.conn.execute(
+            "SELECT * FROM evidence_grants WHERE report_id=? AND evidence_id=? AND user_id=?",
+            (report_id, evidence_id, user_id),
+        ).fetchone()
+        if not grant or grant["status"] != "active":
+            raise DomainError("授权不存在或已失效")
+        now = datetime.now().isoformat()
+        with self.transaction():
+            self.conn.execute("UPDATE evidence_grants SET status='revoked',updated_at=? WHERE id=?", (now, grant["id"]))
+            self._grant_event(grant["id"], report_id, evidence_id, user_id, "revoked", grant["expires_on"], None, coordinator_id)
+            evidence_name = self.conn.execute("SELECT name FROM evidence WHERE id=?", (evidence_id,)).fetchone()["name"]
+            self._notify(report_id, user_id, "grant", f"材料《{evidence_name}》的查看授权已被撤销")
+
+    def _grant_event(self, grant_id: int, report_id: int, evidence_id: int, user_id: int, action: str,
+                     old_expires_on: str | None, new_expires_on: str | None, actor_id: int) -> None:
+        self.conn.execute(
+            "INSERT INTO evidence_grant_events(grant_id,report_id,evidence_id,user_id,action,old_expires_on,new_expires_on,actor_id,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (grant_id, report_id, evidence_id, user_id, action, old_expires_on, new_expires_on, actor_id, datetime.now().isoformat()),
+        )
+
+    def _active_grant_index(self, report_id: int, today: date) -> set[tuple[int, int]]:
+        rows = self.conn.execute(
+            "SELECT evidence_id,user_id FROM evidence_grants WHERE report_id=? AND status='active' AND expires_on>=?",
+            (report_id, today.isoformat()),
+        ).fetchall()
+        return {(row["evidence_id"], row["user_id"]) for row in rows}
+
+    def _grant_state(self, grant: sqlite3.Row, today: date) -> str:
+        if grant["status"] == "revoked":
+            return "revoked"
+        if grant["status"] == "published_out":
+            return "published_out"
+        if grant["expires_on"] < today.isoformat():
+            return "expired"
+        return "active"
+
+    def _grants_payload(self, report_id: int, user: sqlite3.Row, today: date) -> dict:
+        rows = self.conn.execute(
+            "SELECT g.*,e.name AS evidence_name,u.name AS user_name FROM evidence_grants g "
+            "JOIN evidence e ON e.id=g.evidence_id JOIN users u ON u.id=g.user_id "
+            "WHERE g.report_id=? ORDER BY g.id", (report_id,)
+        ).fetchall()
+        grants = {"active": [], "expired": []}
+        for row in rows:
+            if user["role"] != "coordinator" and row["user_id"] != user["id"]:
+                continue
+            entry = dict(row)
+            entry["state"] = self._grant_state(row, today)
+            grants["active" if entry["state"] == "active" else "expired"].append(entry)
+        return grants
+
+    def get_report_for_user(self, report_id: int, user_id: int, as_of: str | None = None) -> dict:
         if not self.can_view(report_id, user_id):
             raise DomainError("无权查看该漏洞报告")
         report = self.conn.execute(
@@ -291,9 +425,13 @@ class VulnerabilityDB:
         if not report:
             raise DomainError("报告不存在")
         user = self._user(user_id)
+        today = self._today(as_of)
+        active_grants = set() if report["status"] == "published" else self._active_grant_index(report_id, today)
         evidence = []
         for row in self.conn.execute("SELECT * FROM evidence WHERE report_id=? ORDER BY id", (report_id,)).fetchall():
             if row["classification"] == "coordinator" and user["role"] not in {"coordinator", "reporter"}:
+                continue
+            if user["role"] == "maintainer" and row["uploaded_by"] != user_id and (row["id"], user_id) not in active_grants:
                 continue
             evidence.append(dict(row))
         payload = dict(report)
@@ -302,6 +440,11 @@ class VulnerabilityDB:
             "SELECT m.*,u.name,u.role FROM report_members m JOIN users u ON u.id=m.user_id WHERE m.report_id=?", (report_id,)
         )]
         payload["evidence"] = evidence
+        payload["grants"] = self._grants_payload(report_id, user, today)
+        if user["role"] == "coordinator":
+            payload["grant_events"] = [dict(r) for r in self.conn.execute(
+                "SELECT * FROM evidence_grant_events WHERE report_id=? ORDER BY id", (report_id,)
+            )]
         payload["fix_plan"] = dict(self.conn.execute("SELECT * FROM fix_plans WHERE report_id=?", (report_id,)).fetchone() or {})
         payload["history"] = [dict(r) for r in self.conn.execute("SELECT * FROM status_history WHERE report_id=? ORDER BY id", (report_id,))]
         payload["extensions"] = [dict(r) for r in self.conn.execute("SELECT * FROM extensions WHERE report_id=? ORDER BY id", (report_id,))]
@@ -414,12 +557,20 @@ class VulnerabilityDB:
         draft = self.conn.execute("SELECT * FROM advisory_drafts WHERE report_id=?", (report_id,)).fetchone()
         if not draft:
             raise DomainError("已解决报告必须先生成公告草稿才能发布")
-        self.conn.execute(
-            "UPDATE advisory_drafts SET status='published',published_at=? WHERE report_id=?", (when, report_id)
-        )
-        self.conn.execute("UPDATE reports SET public_at=? WHERE id=?", (when, report_id))
-        for member in self.conn.execute("SELECT user_id FROM report_members WHERE report_id=?", (report_id,)).fetchall():
-            self._notify(report_id, member["user_id"], "published", "漏洞公告已公开")
+        publish_day = when[:10]
+        with self.transaction():
+            self.conn.execute(
+                "UPDATE advisory_drafts SET status='published',published_at=? WHERE report_id=?", (when, report_id)
+            )
+            self.conn.execute("UPDATE reports SET public_at=? WHERE id=?", (when, report_id))
+            for grant in self.conn.execute(
+                "SELECT * FROM evidence_grants WHERE report_id=? AND status='active' AND expires_on>=?", (report_id, publish_day)
+            ).fetchall():
+                self.conn.execute("UPDATE evidence_grants SET status='published_out',updated_at=? WHERE id=?", (when, grant["id"]))
+                self._grant_event(grant["id"], report_id, grant["evidence_id"], grant["user_id"], "published_out", grant["expires_on"], None, user_id)
+                self._notify(report_id, grant["user_id"], "grant", "公告已公开，材料查看授权自动失效")
+            for member in self.conn.execute("SELECT user_id FROM report_members WHERE report_id=?", (report_id,)).fetchall():
+                self._notify(report_id, member["user_id"], "published", "漏洞公告已公开")
 
     def publish_report(self, report_id: int, coordinator_id: int, as_of: str | None = None) -> None:
         actor = self._user(coordinator_id)
